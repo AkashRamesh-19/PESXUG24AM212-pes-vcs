@@ -600,3 +600,165 @@ The following questions cover filesystem concepts beyond the implementation scop
 - **Git Internals** (Pro Git book): https://git-scm.com/book/en/v2/Git-Internals-Plumbing-and-Porcelain
 - **Git from the inside out**: https://codewords.recurse.com/issues/two/git-from-the-inside-out
 - **The Git Parable**: https://tom.preston-werner.com/2009/05/19/the-git-parable.html
+
+- # Phase 5 & 6 – Analysis Answers
+
+## Phase 5: Branching and Checkout
+
+### Q5.1: How would you implement `pes checkout <branch>`?
+
+A branch in PES (like Git) is a file inside `.pes/refs/heads/` that contains a commit hash.
+
+To implement `pes checkout <branch>`:
+
+1. Check if the branch exists:
+   - Verify file `.pes/refs/heads/<branch>` exists.
+
+2. Update HEAD:
+   - Modify `.pes/HEAD` to:
+     ```
+     ref: refs/heads/<branch>
+     ```
+
+3. Read the commit hash:
+   - Open the branch file and read the commit hash.
+
+4. Restore working directory:
+   - Load the commit object.
+   - Get its tree.
+   - Recursively recreate files and directories from the tree.
+   - Replace current working directory contents.
+
+#### Why is this complex?
+
+- Must safely overwrite existing files
+- Must handle nested directories
+- Must detect conflicts with modified files
+- Requires recursive traversal of tree objects
+
+
+---
+
+### Q5.2: How to detect a dirty working directory?
+
+A dirty working directory means files have been modified but not committed.
+
+Steps to detect:
+
+1. For each file in the index:
+   - Compare current file metadata:
+     - Modification time (mtime)
+     - File size
+
+2. If mismatch:
+   - File is modified
+
+3. If file is missing:
+   - File is deleted
+
+4. Compare with target branch:
+   - If a file differs between branches AND is modified locally → conflict
+
+#### Condition to block checkout:
+
+Checkout must be refused if:
+- A file is modified locally AND
+- That file is different in the target branch
+
+
+---
+
+### Q5.3: What is Detached HEAD?
+
+Detached HEAD means:
+- `.pes/HEAD` contains a commit hash directly instead of a branch reference
+
+#### What happens in this state?
+
+- New commits can still be created
+- But they are not linked to any branch
+- These commits become unreachable (dangling)
+
+#### How to recover these commits?
+
+1. Find the commit hash using:
+
+pes log
+
+
+2. Create a new branch pointing to that commit:
+
+pes branch new-branch
+
+
+This makes the commits reachable again.
+
+
+---
+
+## Phase 6: Garbage Collection
+
+### Q6.1: How to find and delete unreachable objects?
+
+Over time, objects (blobs, trees, commits) may become unreachable.
+
+#### Algorithm:
+
+1. Start from all branch heads:
+- `.pes/refs/heads/*`
+
+2. Traverse all reachable objects:
+- Commit → Tree → Blobs/Subtrees
+
+3. Store all visited hashes in a set (reachable set)
+
+4. Scan `.pes/objects/` directory
+
+5. Delete objects not present in reachable set
+
+#### Data Structure:
+
+Use a **Hash Set**:
+- Provides O(1) lookup
+- Efficient for large repositories
+
+#### Estimation:
+
+For:
+- 100,000 commits
+- 50 branches
+
+You may visit:
+- ~100,000 commits
+- Plus trees and blobs
+
+Total objects: several hundred thousand
+
+
+---
+
+### Q6.2: Why is garbage collection dangerous during commit?
+
+#### Race condition:
+
+1. A commit is being created:
+- Objects are being written but not yet referenced
+
+2. Garbage collection runs simultaneously:
+- It does not see these objects as reachable
+- Deletes them
+
+3. Commit completes:
+- Now references missing objects
+
+#### Result:
+Repository corruption
+
+#### How real Git avoids this:
+
+- Uses lock files to prevent concurrent operations
+- Writes objects first, updates references later
+- Runs garbage collection only when safe
+- Uses safety mechanisms like:
+- Grace periods
+- Reference tracking
