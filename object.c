@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
 #include <openssl/evp.h>
 
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
@@ -60,6 +61,16 @@ int object_exists(const ObjectID *id) {
     return access(path, F_OK) == 0;
 }
 
+static int write_all(int fd, const uint8_t *buf, size_t len) {
+    size_t written = 0;
+    while (written < len) {
+        ssize_t rc = write(fd, buf + written, len - written);
+        if (rc <= 0) return -1;
+        written += (size_t)rc;
+    }
+    return 0;
+}
+
 // ─── TODO: Implement these ──────────────────────────────────────────────────
 
 // Write an object to the store.
@@ -90,67 +101,96 @@ int object_exists(const ObjectID *id) {
 //   - fsync              : flushing the file descriptor to disk
 //   - rename             : atomically moving the temp file to the final path
 //
+
+//
 // Returns 0 on success, -1 on error.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
+    static const char *type_names[] = {"blob", "tree", "commit"};
     char header[64];
-    const char *type_str;
+    if (type < OBJ_BLOB || type > OBJ_COMMIT) return -1;
 
-    if (type == OBJ_BLOB) type_str = "blob";
-    else if (type == OBJ_TREE) type_str = "tree";
-    else if (type == OBJ_COMMIT) type_str = "commit";
-    else return -1;
+    int header_chars = snprintf(header, sizeof(header), "%s %zu", type_names[type], len);
+    if (header_chars < 0 || (size_t)header_chars >= sizeof(header) - 1) return -1;
 
-    int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len) + 1;
+    int header_len = header_chars + 1;
+    size_t total_len = (size_t)header_len + len;
 
-    size_t total_len = header_len + len;
-    char *full = malloc(total_len);
-    if (!full) return -1;
+    uint8_t *full_object = malloc(total_len);
+    if (!full_object) return -1;
 
-    memcpy(full, header, header_len);
-    memcpy(full + header_len, data, len);
+    memcpy(full_object, header, (size_t)header_len);
+    if (len > 0) memcpy(full_object + header_len, data, len);
 
-    compute_hash(full, total_len, id_out);
-
+    compute_hash(full_object, total_len, id_out);
     if (object_exists(id_out)) {
-        free(full);
+        free(full_object);
         return 0;
     }
 
-    char path[512];
-    object_path(id_out, path, sizeof(path));
+    mkdir(OBJECTS_DIR, 0755);
 
-    char dir[512];
-    strncpy(dir, path, sizeof(dir));
-    char *slash = strrchr(dir, '/');
-    if (slash) {
-        *slash = '\0';
-        mkdir(dir, 0755);
+    char final_path[512];
+    object_path(id_out, final_path, sizeof(final_path));
+
+    char shard_dir[512];
+    snprintf(shard_dir, sizeof(shard_dir), "%s", final_path);
+    char *slash = strrchr(shard_dir, '/');
+    if (!slash) {
+        free(full_object);
+        return -1;
+    }
+    *slash = '\0';
+    if (mkdir(shard_dir, 0755) != 0 && errno != EEXIST) {
+        free(full_object);
+        return -1;
     }
 
-    char temp_path[512];
-    snprintf(temp_path, sizeof(temp_path), "%s.tmp", path);
-
-    int fd = open(temp_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    char temp_path[560];
+    int fd = -1;
+    for (int attempt = 0; attempt < 16; attempt++) {
+        snprintf(temp_path, sizeof(temp_path), "%s.tmp.%ld.%d", final_path, (long)getpid(), attempt);
+        fd = open(temp_path, O_CREAT | O_WRONLY | O_TRUNC | O_EXCL, 0644);
+        if (fd >= 0) break;
+        if (errno != EEXIST) break;
+    }
     if (fd < 0) {
-        free(full);
+        free(full_object);
         return -1;
     }
 
-    if (write(fd, full, total_len) != (ssize_t)total_len) {
+    if (write_all(fd, full_object, total_len) != 0) {
         close(fd);
-        free(full);
+        unlink(temp_path);
+        free(full_object);
         return -1;
     }
 
-    fsync(fd);
-    close(fd);
-
-    if (rename(temp_path, path) != 0) {
-        free(full);
+    if (fsync(fd) != 0) {
+        close(fd);
+        unlink(temp_path);
+        free(full_object);
         return -1;
     }
 
-    free(full);
+    if (close(fd) != 0) {
+        unlink(temp_path);
+        free(full_object);
+        return -1;
+    }
+
+    if (rename(temp_path, final_path) != 0) {
+        unlink(temp_path);
+        free(full_object);
+        return -1;
+    }
+
+    int dir_fd = open(shard_dir, O_RDONLY | O_DIRECTORY);
+    if (dir_fd >= 0) {
+        fsync(dir_fd);
+        close(dir_fd);
+    }
+
+    free(full_object);
     return 0;
 }
 
@@ -180,65 +220,92 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
     char path[512];
     object_path(id, path, sizeof(path));
 
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return -1;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
 
-    fseek(fp, 0, SEEK_END);
-    size_t size = ftell(fp);
-    rewind(fp);
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return -1;
+    }
+    long file_size = ftell(f);
+    if (file_size < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
 
-    char *buffer = malloc(size);
+    if (file_size == 0) {
+        fclose(f);
+        return -1;
+    }
+
+    uint8_t *buffer = malloc((size_t)file_size);
     if (!buffer) {
-        fclose(fp);
+        fclose(f);
         return -1;
     }
 
-    if (fread(buffer, 1, size, fp) != size) {
-        fclose(fp);
+    if (fread(buffer, 1, (size_t)file_size, f) != (size_t)file_size) {
         free(buffer);
+        fclose(f);
         return -1;
     }
-    fclose(fp);
+    fclose(f);
 
-    ObjectID computed;
-    compute_hash(buffer, size, &computed);
-
-    if (memcmp(computed.hash, id->hash, HASH_SIZE) != 0) {
-        free(buffer);
-        return -1;
-    }
-
-    char *null_pos = memchr(buffer, '\0', size);
-    if (!null_pos) {
+    const uint8_t *null_byte = memchr(buffer, '\0', (size_t)file_size);
+    if (!null_byte) {
         free(buffer);
         return -1;
     }
 
-    size_t header_len = null_pos - buffer;
+    size_t header_len = (size_t)(null_byte - buffer);
+    char header[64];
+    if (header_len >= sizeof(header)) {
+        free(buffer);
+        return -1;
+    }
+    memcpy(header, buffer, header_len);
+    header[header_len] = '\0';
 
-    if (strncmp(buffer, "blob", 4) == 0)
-        *type_out = OBJ_BLOB;
-    else if (strncmp(buffer, "tree", 4) == 0)
-        *type_out = OBJ_TREE;
-    else if (strncmp(buffer, "commit", 6) == 0)
-        *type_out = OBJ_COMMIT;
+    char type_name[16];
+    size_t data_len = 0;
+    if (sscanf(header, "%15s %zu", type_name, &data_len) != 2) {
+        free(buffer);
+        return -1;
+    }
+
+    ObjectType parsed_type;
+    if (strcmp(type_name, "blob") == 0) parsed_type = OBJ_BLOB;
+    else if (strcmp(type_name, "tree") == 0) parsed_type = OBJ_TREE;
+    else if (strcmp(type_name, "commit") == 0) parsed_type = OBJ_COMMIT;
     else {
         free(buffer);
         return -1;
     }
 
-    size_t data_len = size - header_len - 1;
-    void *data = malloc(data_len);
-    if (!data) {
+    size_t payload_offset = header_len + 1;
+    if (payload_offset > (size_t)file_size || payload_offset + data_len != (size_t)file_size) {
         free(buffer);
         return -1;
     }
 
-    memcpy(data, buffer + header_len + 1, data_len);
+    ObjectID actual_id;
+    compute_hash(buffer, (size_t)file_size, &actual_id);
+    if (memcmp(actual_id.hash, id->hash, HASH_SIZE) != 0) {
+        free(buffer);
+        return -1;
+    }
 
-    *data_out = data;
+    uint8_t *payload = malloc(data_len + 1);
+    if (!payload) {
+        free(buffer);
+        return -1;
+    }
+    if (data_len > 0) memcpy(payload, buffer + payload_offset, data_len);
+    payload[data_len] = '\0';
+
+    *type_out = parsed_type;
+    *data_out = payload;
     *len_out = data_len;
-
     free(buffer);
     return 0;
 }
